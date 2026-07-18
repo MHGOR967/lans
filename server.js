@@ -2,26 +2,57 @@ const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const puppeteer = require('puppeteer');
 const fs = require('fs');
-const path = require('path');
 const axios = require('axios');
+const FormData = require('form-data');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const BOT_TOKEN = process.env.BOT_TOKEN || '8737255406:AAGDfuIznZb3zjVV3Px0d6M4g4jjiRtm9gM';
 
-// Start Express first for Render
+// Start Express first
 app.get('/', (req, res) => res.send('Lens Bot is running!'));
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startBot();
 });
 
-// ===== Google Lens Search =====
-async function searchGoogleLens(imagePath) {
+// ===== Upload image to get public URL =====
+async function uploadImage(imagePath) {
+  // Upload to 0x0.st (free, no API key needed)
+  const form = new FormData();
+  form.append('file', fs.createReadStream(imagePath));
+  
+  try {
+    const response = await axios.post('https://0x0.st', form, {
+      headers: form.getHeaders(),
+      timeout: 15000
+    });
+    return response.data.trim();
+  } catch (e) {
+    // Fallback: upload to litterbox (temp file host)
+    const form2 = new FormData();
+    form2.append('reqtype', 'fileupload');
+    form2.append('time', '1h');
+    form2.append('fileToUpload', fs.createReadStream(imagePath));
+    
+    const response2 = await axios.post('https://litterbox.catbox.moe/resources/internals/api.php', form2, {
+      headers: form2.getHeaders(),
+      timeout: 15000
+    });
+    return response2.data.trim();
+  }
+}
+
+// ===== Yandex Reverse Image Search =====
+async function searchYandex(imagePath) {
   let browser;
   try {
+    // First upload the image to get a public URL
+    const imageUrl = await uploadImage(imagePath);
+    console.log('Image uploaded:', imageUrl);
+
     browser = await puppeteer.launch({
       headless: 'new',
       executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
@@ -39,98 +70,85 @@ async function searchGoogleLens(imagePath) {
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1280, height: 900 });
 
-    // Go to Google Images
-    await page.goto('https://images.google.com', { waitUntil: 'networkidle2', timeout: 30000 });
-    await new Promise(r => setTimeout(r, 2000));
+    // Use Yandex reverse image search URL directly
+    const yandexUrl = `https://yandex.com/images/search?rpt=imageview&url=${encodeURIComponent(imageUrl)}`;
+    console.log('Searching:', yandexUrl);
 
-    // Click camera icon (search by image)
-    const cameraBtn = await page.$('[aria-label="Search by image"]') || await page.$('.nDcEnd');
-    if (cameraBtn) {
-      await cameraBtn.click();
-      await new Promise(r => setTimeout(r, 2000));
-    } else {
-      // Try alternative selector
-      const btns = await page.$$('div[role="button"]');
-      for (let btn of btns) {
-        const text = await page.evaluate(el => el.getAttribute('aria-label'), btn);
-        if (text && text.includes('image')) {
-          await btn.click();
-          await new Promise(r => setTimeout(r, 2000));
-          break;
-        }
-      }
-    }
+    await page.goto(yandexUrl, { waitUntil: 'networkidle2', timeout: 45000 });
+    await new Promise(r => setTimeout(r, 5000));
 
-    // Upload image
-    const uploadInput = await page.$('input[type="file"]');
-    if (uploadInput) {
-      await uploadInput.uploadFile(imagePath);
-      await new Promise(r => setTimeout(r, 5000));
-    } else {
-      await browser.close();
-      return { success: false, error: 'لم أتمكن من إيجاد زر رفع الصورة' };
-    }
-
-    // Wait for results
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-    await new Promise(r => setTimeout(r, 3000));
-
-    // Get current URL
-    const resultUrl = page.url();
-
-    // Try to get text results
+    // Extract results
     const results = await page.evaluate(() => {
       let data = {
         title: '',
         descriptions: [],
-        links: [],
-        locations: []
+        similarSites: [],
+        tags: []
       };
 
-      // Get page title/main result
-      const mainTitle = document.querySelector('h1, h2, [data-attrid="title"]');
-      if (mainTitle) data.title = mainTitle.textContent.trim();
+      // Get page title or main description
+      const titles = document.querySelectorAll('.CbirObjectResponse-Title, .CbirItem-Title, h2, .MMViewerButtons-TextContainer');
+      titles.forEach(el => {
+        const text = el.textContent.trim();
+        if (text.length > 3 && text.length < 200) {
+          data.title = text;
+        }
+      });
 
-      // Get all text that might contain location info
+      // Get tags/categories
+      const tags = document.querySelectorAll('.CbirTags-Tag, .Tags-Tag, .CbirItem-Tag, a[class*="Tag"]');
+      tags.forEach(el => {
+        const text = el.textContent.trim();
+        if (text.length > 1 && text.length < 50) {
+          data.tags.push(text);
+        }
+      });
+
+      // Get descriptions from similar images
+      const descriptions = document.querySelectorAll('.CbirSites-ItemTitle, .CbirItem-Title, .CbirSites-ItemDescription, .Thumb-Title, [class*="Description"]');
+      descriptions.forEach((el, i) => {
+        if (i < 8) {
+          const text = el.textContent.trim();
+          if (text.length > 5 && text.length < 300) {
+            data.descriptions.push(text);
+          }
+        }
+      });
+
+      // Get similar sites/sources
+      const sites = document.querySelectorAll('.CbirSites-Item a, .CbirSites-ItemDomain');
+      sites.forEach((el, i) => {
+        if (i < 5) {
+          const text = el.textContent.trim();
+          const href = el.href || '';
+          if (text.length > 3) {
+            data.similarSites.push({ text: text.substring(0, 100), url: href });
+          }
+        }
+      });
+
+      // Also try to get "Other sizes" or "Pages with this image"
+      const otherResults = document.querySelectorAll('.other-sites__item-title, .CbirOtherSizes-Item, a[class*="Site"]');
+      otherResults.forEach((el, i) => {
+        if (i < 5) {
+          const text = el.textContent.trim();
+          const href = el.href || '';
+          if (text.length > 3) {
+            data.similarSites.push({ text: text.substring(0, 100), url: href });
+          }
+        }
+      });
+
+      // Get any text that looks like a location or place name
       const allText = document.body.innerText;
-      
-      // Look for location-related keywords
-      const locationKeywords = ['located', 'location', 'address', 'city', 'country', 'street', 'park', 'palace', 'building', 'monument'];
-      const lines = allText.split('\n').filter(line => line.trim().length > 5);
-      
-      // Get first meaningful results
-      const resultElements = document.querySelectorAll('[data-text-ad], .g, [data-hveid], .srKDX, .UAiK1e');
-      resultElements.forEach((el, i) => {
-        if (i < 5) {
-          const text = el.textContent.trim();
-          if (text.length > 10 && text.length < 500) {
-            data.descriptions.push(text.substring(0, 200));
-          }
-        }
-      });
-
-      // Get links
-      const linkElements = document.querySelectorAll('a[href*="http"]');
-      linkElements.forEach((el, i) => {
-        if (i < 5) {
-          const href = el.href;
-          const text = el.textContent.trim();
-          if (text.length > 3 && !href.includes('google.com') && !href.includes('gstatic')) {
-            data.links.push({ text: text.substring(0, 100), url: href });
-          }
-        }
-      });
-
-      // Look for "Exact matches" or visual matches text
-      const exactMatches = document.querySelectorAll('.fKDtNb, .VFACy, .UAiK1e, .OSrXXb');
-      exactMatches.forEach((el, i) => {
-        if (i < 5) {
-          const text = el.textContent.trim();
-          if (text.length > 5) {
-            data.descriptions.push(text.substring(0, 200));
-          }
-        }
-      });
+      const lines = allText.split('\n').filter(l => l.trim().length > 10 && l.trim().length < 150);
+      const locationHints = lines.filter(l => 
+        /hotel|resort|park|palace|museum|city|pool|swim|beach|tower|bridge|mosque|church/i.test(l) ||
+        /فندق|منتجع|حديقة|قصر|متحف|مدينة|مسبح|شاطئ|برج|جسر|مسجد/i.test(l)
+      );
+      if (locationHints.length > 0) {
+        data.descriptions = [...locationHints.slice(0, 3), ...data.descriptions];
+      }
 
       return data;
     });
@@ -139,11 +157,13 @@ async function searchGoogleLens(imagePath) {
     const screenshotPath = imagePath.replace('.jpg', '_results.png');
     await page.screenshot({ path: screenshotPath, fullPage: false });
 
+    const resultUrl = page.url();
     await browser.close();
 
     return {
       success: true,
       resultUrl,
+      imageUrl,
       results,
       screenshotPath
     };
@@ -167,15 +187,15 @@ function startBot() {
   bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     bot.sendMessage(chatId,
-`🔍 *بوت البحث بالصور (Google Lens)*
+`🔍 *بوت البحث بالصور*
 
 أرسل لي أي صورة وأبحث لك عنها!
 
-📸 أرسل صورة مكان (قصر، حديقة، شارع، مبنى)
-🔎 أبحث لك وأحاول أعرف وين الموقع
-📋 أرجع لك النتائج + سكرين شوت لنتائج البحث
+📸 أرسل صورة مكان (قصر، حديقة، شارع، مبنى، مسبح)
+🔎 أبحث لك في Yandex وأحاول أعرف وين الموقع
+📋 أرجع لك النتائج + سكرين شوت
 
-*الاستخدام:* ارسل صورة وانتظر النتيجة (10-20 ثانية)`, {
+*الاستخدام:* ارسل صورة وانتظر (15-30 ثانية)`, {
       parse_mode: 'Markdown'
     });
   });
@@ -185,58 +205,62 @@ function startBot() {
     const chatId = msg.chat.id;
 
     try {
-      await bot.sendMessage(chatId, '🔍 جاري البحث عن الصورة... انتظر 10-20 ثانية');
+      await bot.sendMessage(chatId, '🔍 جاري البحث... انتظر 15-30 ثانية');
 
       // Get highest resolution photo
       const photo = msg.photo[msg.photo.length - 1];
-      const fileId = photo.file_id;
-
-      // Download the photo
-      const file = await bot.getFile(fileId);
+      const file = await bot.getFile(photo.file_id);
       const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
       
       const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
       const imagePath = `/tmp/lens_${chatId}_${Date.now()}.jpg`;
       fs.writeFileSync(imagePath, response.data);
 
-      // Search with Google Lens
-      const result = await searchGoogleLens(imagePath);
+      // Search
+      const result = await searchYandex(imagePath);
 
       if (result.success) {
-        // Build response message
         let message = '🔍 *نتائج البحث:*\n\n';
 
         if (result.results.title) {
           message += `📌 *${result.results.title}*\n\n`;
         }
 
+        if (result.results.tags.length > 0) {
+          const uniqueTags = [...new Set(result.results.tags)].slice(0, 5);
+          message += `🏷 *تصنيفات:* ${uniqueTags.join(' | ')}\n\n`;
+        }
+
         if (result.results.descriptions.length > 0) {
           message += '📋 *معلومات:*\n';
-          const uniqueDescs = [...new Set(result.results.descriptions)].slice(0, 3);
+          const uniqueDescs = [...new Set(result.results.descriptions)].slice(0, 4);
           uniqueDescs.forEach(desc => {
             message += `• ${desc}\n`;
           });
           message += '\n';
         }
 
-        if (result.results.links.length > 0) {
-          message += '🔗 *روابط ذات صلة:*\n';
-          const uniqueLinks = result.results.links.slice(0, 3);
-          uniqueLinks.forEach(link => {
-            message += `• [${link.text}](${link.url})\n`;
+        if (result.results.similarSites.length > 0) {
+          message += '🔗 *مصادر:*\n';
+          const uniqueSites = result.results.similarSites.slice(0, 3);
+          uniqueSites.forEach(site => {
+            if (site.url && site.url.startsWith('http')) {
+              message += `• [${site.text}](${site.url})\n`;
+            } else {
+              message += `• ${site.text}\n`;
+            }
           });
           message += '\n';
         }
 
-        message += `🌐 [فتح النتائج في Google](${result.resultUrl})`;
+        message += `🌐 [فتح النتائج كاملة](${result.resultUrl})`;
 
-        // Send results text
         await bot.sendMessage(chatId, message, { 
           parse_mode: 'Markdown',
           disable_web_page_preview: true 
         });
 
-        // Send screenshot of results
+        // Send screenshot
         if (result.screenshotPath && fs.existsSync(result.screenshotPath)) {
           await bot.sendPhoto(chatId, result.screenshotPath, {
             caption: '📸 سكرين شوت لنتائج البحث'
@@ -248,7 +272,7 @@ function startBot() {
         await bot.sendMessage(chatId, `❌ خطأ: ${result.error}\n\nجرب صورة ثانية.`);
       }
 
-      // Delete temp image
+      // Cleanup
       if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
 
     } catch (error) {
@@ -257,7 +281,7 @@ function startBot() {
     }
   });
 
-  // Handle documents (images sent as files)
+  // Handle documents (images as files)
   bot.on('document', async (msg) => {
     const chatId = msg.chat.id;
     const doc = msg.document;
@@ -267,7 +291,7 @@ function startBot() {
     }
 
     try {
-      await bot.sendMessage(chatId, '🔍 جاري البحث عن الصورة... انتظر 10-20 ثانية');
+      await bot.sendMessage(chatId, '🔍 جاري البحث... انتظر 15-30 ثانية');
 
       const file = await bot.getFile(doc.file_id);
       const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
@@ -276,7 +300,7 @@ function startBot() {
       const imagePath = `/tmp/lens_${chatId}_${Date.now()}.jpg`;
       fs.writeFileSync(imagePath, response.data);
 
-      const result = await searchGoogleLens(imagePath);
+      const result = await searchYandex(imagePath);
 
       if (result.success) {
         let message = '🔍 *نتائج البحث:*\n\n';
@@ -285,25 +309,34 @@ function startBot() {
           message += `📌 *${result.results.title}*\n\n`;
         }
 
+        if (result.results.tags.length > 0) {
+          const uniqueTags = [...new Set(result.results.tags)].slice(0, 5);
+          message += `🏷 *تصنيفات:* ${uniqueTags.join(' | ')}\n\n`;
+        }
+
         if (result.results.descriptions.length > 0) {
           message += '📋 *معلومات:*\n';
-          const uniqueDescs = [...new Set(result.results.descriptions)].slice(0, 3);
+          const uniqueDescs = [...new Set(result.results.descriptions)].slice(0, 4);
           uniqueDescs.forEach(desc => {
             message += `• ${desc}\n`;
           });
           message += '\n';
         }
 
-        if (result.results.links.length > 0) {
-          message += '🔗 *روابط ذات صلة:*\n';
-          const uniqueLinks = result.results.links.slice(0, 3);
-          uniqueLinks.forEach(link => {
-            message += `• [${link.text}](${link.url})\n`;
+        if (result.results.similarSites.length > 0) {
+          message += '🔗 *مصادر:*\n';
+          const uniqueSites = result.results.similarSites.slice(0, 3);
+          uniqueSites.forEach(site => {
+            if (site.url && site.url.startsWith('http')) {
+              message += `• [${site.text}](${site.url})\n`;
+            } else {
+              message += `• ${site.text}\n`;
+            }
           });
           message += '\n';
         }
 
-        message += `🌐 [فتح النتائج في Google](${result.resultUrl})`;
+        message += `🌐 [فتح النتائج كاملة](${result.resultUrl})`;
 
         await bot.sendMessage(chatId, message, { 
           parse_mode: 'Markdown',
