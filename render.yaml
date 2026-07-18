@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: lens-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: BOT_TOKEN
+        value: 8737255406:AAGDfuIznZb3zjVV3Px0d6M4g4jjiRtm9gM
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
